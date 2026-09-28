@@ -110,8 +110,7 @@ export const TEXT = {
     '/lang — language for translations and explanations\n' +
     '/pause — stop daily messages · /resume — start again\n' +
     '/stats — your progress\n\n' +
-    'You can also just write or send me a voice message in English anytime — I’ll check it.\n\n' +
-    '<i>Your answers are processed by Google Gemini to give feedback. Please don’t send private information.</i>',
+    'You can also just write or send me a voice message in English anytime — I’ll check it.\n\n',
   todayMenu: 'What would you like to open?',
   preparing: '⏳ Preparing today’s lesson…',
   lessonFailed: '😔 I couldn’t prepare the lesson right now. Please try /today again a bit later.',
