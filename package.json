@@ -1,0 +1,33 @@
+{
+  "name": "english-a2-bot",
+  "version": "0.1.0",
+  "description": "Telegram bot for A2 English learners: daily words, a story with voice questions, an evening quiz — with Gemini feedback.",
+  "scripts": {
+    "typecheck": "tsc",
+    "test": "vitest run",
+    "dev": "tsx --env-file=.env.local scripts/dev.ts",
+    "db:migrate": "tsx --env-file=.env.local scripts/migrate.ts",
+    "set-webhook": "tsx --env-file=.env.local scripts/set-webhook.ts",
+    "stage": "tsx --env-file=.env.local scripts/stage.ts",
+    "build:wordlist": "node scripts/build-wordlist.mjs"
+  },
+  "type": "module",
+  "dependencies": {
+    "@breezystack/lamejs": "^1.2.7",
+    "@google/genai": "^2.24.0",
+    "@grammyjs/auto-retry": "^2.0.2",
+    "@neondatabase/serverless": "^1.1.0",
+    "@vercel/functions": "^3.9.9",
+    "grammy": "^1.46.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "tsx": "^4.23.15",
+    "typescript": "~5.9",
+    "vitest": "^5.0.2"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  }
+}
