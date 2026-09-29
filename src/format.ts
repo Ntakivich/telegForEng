@@ -1,4 +1,5 @@
 import type { HintLang } from './config.js';
+import { TOPICS } from './content/topics.js';
 import type { Lesson } from './lesson-types.js';
 import type { Feedback } from './review.js';
 
@@ -43,8 +44,10 @@ export function wordsMessage(lesson: Lesson, lang: HintLang): string {
     if (w.tip) lines.push(`💡 ${esc(w.tip)}`);
     return lines.join('\n');
   });
+  const topic = TOPICS.find((t) => t.id === lesson.topic)?.label;
+  const focus = topic ? `${topic} · ${lesson.theme}` : lesson.theme;
   return [
-    `☀️ <b>Good morning!</b>\nToday: <b>${esc(lesson.title)}</b>`,
+    `☀️ <b>Good morning!</b>\nToday: <b>${esc(lesson.title)}</b>${focus ? `\n<i>${esc(focus)}</i>` : ''}`,
     ...cards,
     '🎧 Listen below and repeat each word out loud.\nAt lunch — a short story with these words.',
   ].join('\n\n');
@@ -99,6 +102,7 @@ export const TEXT = {
     '☀️ <b>Morning</b> — 6 new words with examples and audio\n' +
     '📖 <b>Lunch</b> — a short story with these words + 2 questions to answer <b>by voice</b>\n' +
     '🌙 <b>Evening</b> — a quiz + a short writing task\n\n' +
+    'You choose a topic for the week (change it anytime with /topic).\n' +
     'After each answer you get quick feedback: what was good, what to fix, and a better way to say it.\n' +
     'Missed something? No problem — nothing is urgent. Use /today anytime.\n\n' +
     'First, which language should I use for translations and explanations?',
@@ -107,11 +111,22 @@ export const TEXT = {
   help:
     '<b>What I can do</b>\n' +
     '/today — today’s words, story, speaking and evening tasks\n' +
+    '/topic — choose the topic of the week\n' +
     '/lang — language for translations and explanations\n' +
     '/pause — stop daily messages · /resume — start again\n' +
     '/stats — your progress\n\n' +
     'You can also just write or send me a voice message in English anytime — I’ll check it.\n\n',
   todayMenu: 'What would you like to open?',
+  chooseTopic:
+    '🗂 <b>Choose a topic.</b> For one week, every day brings new words, a story and tasks about it.\n' +
+    'You can change it anytime with /topic.',
+  topicStarted: (label: string) => `Great choice: <b>${esc(label)}</b>! Here are today’s words 👇`,
+  topicSame: (label: string) => `You’re already on <b>${esc(label)}</b> — keep going! 💪`,
+  topicFromTomorrow: (label: string) => `👍 <b>${esc(label)}</b> starts tomorrow morning ☀️`,
+  topicKept: (label: string) => `👍 One more week of <b>${esc(label)}</b> — starting tomorrow morning ☀️`,
+  weekOffer: (label: string) =>
+    `🎉 You finished a week of <b>${esc(label)}</b>! What would you like next week?\n` +
+    '<i>Pick a new topic or keep this one. If you don’t choose, we’ll simply continue.</i>',
   preparing: '⏳ Preparing today’s lesson…',
   lessonFailed: '😔 I couldn’t prepare the lesson right now. Please try /today again a bit later.',
   checking: '🎧 Checking…',

@@ -1,6 +1,7 @@
 import { autoRetry } from '@grammyjs/auto-retry';
 import { Bot, InlineKeyboard, type Context } from 'grammy';
 import { config, HINT_LANGS, type HintLang } from './config.js';
+import { MIX, TOPICS, topicLabel } from './content/topics.js';
 import {
   claimDelivery,
   countAnswers,
@@ -11,6 +12,7 @@ import {
   saveAnswer,
   setHintLang,
   setStatus,
+  setTopic,
   touchUser,
   useCheck,
   type Stage,
@@ -18,10 +20,10 @@ import {
   type User,
 } from './db.js';
 import { feedbackMessage, LANG_LABELS, TEXT } from './format.js';
-import { ensureLesson, today } from './lesson.js';
+import { addDays, ensureLesson, today } from './lesson.js';
 import type { Lesson } from './lesson-types.js';
 import { reviewAnswer, type Answer, type Feedback } from './review.js';
-import { advanceTask, sendHtml, sendModelAnswerVoice, sendStage } from './stages.js';
+import { advanceTask, nextCallback, sendModelAnswerVoice, sendStage, topicKeyboard } from './stages.js';
 
 type Ctx = Context & { user?: User };
 
@@ -43,14 +45,14 @@ const todayKeyboard = () =>
     .row()
     .text('🌙 Quiz + writing', 'open:evening');
 
-/** Loads today's lesson, telling the user to wait if it has to be generated first. */
-async function lessonForToday(ctx: Ctx): Promise<Lesson | null> {
+/** Loads today's lesson for `topic`, telling the user to wait if it has to be generated first. */
+async function lessonForToday(ctx: Ctx, topic: string): Promise<Lesson | null> {
   const day = today();
-  const existing = await getLesson(day);
+  const existing = await getLesson(day, topic);
   if (existing) return existing;
   const note = await ctx.reply(TEXT.preparing);
   try {
-    return await ensureLesson(day);
+    return await ensureLesson(day, topic);
   } catch (error) {
     console.error('lesson generation failed', error);
     await ctx.reply(TEXT.lessonFailed);
@@ -61,7 +63,7 @@ async function lessonForToday(ctx: Ctx): Promise<Lesson | null> {
 }
 
 async function openStage(ctx: Ctx, user: User, stage: Stage) {
-  const lesson = await lessonForToday(ctx);
+  const lesson = await lessonForToday(ctx, user.topic);
   if (!lesson) return;
   await claimDelivery(user.id, lesson.day, stage); // so the scheduled run doesn't send it again
   await sendStage(ctx.api, user, lesson, stage);
@@ -87,7 +89,7 @@ async function handleAnswer(ctx: Ctx, user: User, incoming: Incoming) {
   await ctx.replyWithChatAction('typing').catch(() => {});
 
   const pending = user.pending;
-  const lesson = await getLesson(pending?.day ?? day);
+  const lesson = pending ? await getLesson(pending.day, pending.topic ?? MIX) : await getLesson(day, user.topic);
   const task = pending && lesson ? (lesson[pending.kind][pending.index] ?? null) : null;
 
   let feedback: Feedback;
@@ -118,7 +120,7 @@ async function handleAnswer(ctx: Ctx, user: User, incoming: Incoming) {
   let text = feedbackMessage(feedback, answer.kind);
   if (task && pending && lesson) {
     const isLast = pending.index + 1 >= lesson[pending.kind].length;
-    kb.text(isLast ? '✅ Finish' : '➡️ Next', `next:${pending.day}:${pending.kind}:${pending.index}`);
+    kb.text(isLast ? '✅ Finish' : '➡️ Next', nextCallback(lesson, pending.kind, pending.index));
     if (pending.kind === 'speaking' && answer.kind === 'text') {
       text += '\n\n🎙 <i>This one is speaking practice — try a voice message next time!</i>';
     }
@@ -163,6 +165,9 @@ export function createBot() {
   pm.command('help', (ctx) => ctx.reply(TEXT.help, { parse_mode: 'HTML' }));
   pm.command('today', (ctx) => ctx.reply(TEXT.todayMenu, { reply_markup: todayKeyboard() }));
   pm.command('lang', (ctx) => ctx.reply(TEXT.chooseLang, { reply_markup: langKeyboard(false) }));
+  pm.command('topic', (ctx) =>
+    ctx.reply(TEXT.chooseTopic, { parse_mode: 'HTML', reply_markup: topicKeyboard('', ctx.user!.topic) }),
+  );
   pm.command('pause', async (ctx) => {
     await setStatus(ctx.user!.id, 'paused');
     await ctx.reply(TEXT.paused);
@@ -185,7 +190,36 @@ export function createBot() {
     await ctx.answerCallbackQuery();
     await ctx.editMessageReplyMarkup().catch(() => {});
     await ctx.reply(TEXT.langSaved(LANG_LABELS[lang]));
-    if (ctx.match[2]) await openStage(ctx, { ...ctx.user!, hintLang: lang }, 'morning');
+    if (ctx.match[2]) {
+      await ctx.reply(TEXT.chooseTopic, { parse_mode: 'HTML', reply_markup: topicKeyboard('start') });
+    }
+  });
+
+  // 'start' (onboarding) and '' (/topic) switch right away and send today's words;
+  // 'week' (the weekly offer, sent in the evening) takes effect tomorrow morning.
+  pm.callbackQuery(/^topic:(\w+)(?::(start|week))?$/, async (ctx) => {
+    const user = ctx.user!;
+    const topic = ctx.match[1]!;
+    const mode = ctx.match[2] ?? '';
+    if (topic !== MIX && !TOPICS.some((t) => t.id === topic)) return ctx.answerCallbackQuery();
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageReplyMarkup().catch(() => {});
+    const label = topicLabel(topic);
+    const day = today();
+    const unchanged = topic === user.topic;
+
+    if (mode === 'week') {
+      await setTopic(user.id, topic, addDays(day, 1));
+      await ctx.reply((unchanged ? TEXT.topicKept : TEXT.topicFromTomorrow)(label), { parse_mode: 'HTML' });
+      return;
+    }
+    if (unchanged && mode !== 'start') {
+      await ctx.reply(TEXT.topicSame(label), { parse_mode: 'HTML' });
+      return;
+    }
+    await setTopic(user.id, topic, day);
+    await ctx.reply(TEXT.topicStarted(label), { parse_mode: 'HTML' });
+    await openStage(ctx, { ...user, topic }, 'morning');
   });
 
   pm.callbackQuery(/^open:(morning|midday|evening)$/, async (ctx) => {
@@ -193,10 +227,12 @@ export function createBot() {
     await openStage(ctx, ctx.user!, ctx.match[1] as Stage);
   });
 
-  pm.callbackQuery(/^next:(\d{4}-\d{2}-\d{2}):(speaking|writing):(\d+)$/, async (ctx) => {
+  // next:<day>[:<topic>]:<kind>:<index> — buttons sent before topics existed have no topic part.
+  pm.callbackQuery(/^next:(\d{4}-\d{2}-\d{2}):(?:(\w+):)?(speaking|writing):(\d+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     await ctx.editMessageReplyMarkup().catch(() => {}); // one tap only
-    await advanceTask(ctx.api, ctx.user!, ctx.match[1]!, ctx.match[2] as TaskKind, Number(ctx.match[3]));
+    const [, day, topic = MIX, kind, index] = ctx.match;
+    await advanceTask(ctx.api, ctx.user!, day!, topic, kind as TaskKind, Number(index));
   });
 
   pm.callbackQuery(/^say:(\d+)$/, async (ctx) => {
@@ -249,6 +285,7 @@ export function createBot() {
 
 export const BOT_COMMANDS = [
   { command: 'today', description: 'Today’s words, story and tasks' },
+  { command: 'topic', description: 'Topic of the week' },
   { command: 'lang', description: 'Language for translations' },
   { command: 'stats', description: 'My progress' },
   { command: 'pause', description: 'Stop daily messages' },

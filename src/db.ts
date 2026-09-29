@@ -10,7 +10,7 @@ export function sql() {
 }
 
 export type TaskKind = 'speaking' | 'writing';
-export type Pending = { day: string; kind: TaskKind; index: number };
+export type Pending = { day: string; topic?: string; kind: TaskKind; index: number };
 export type Stage = 'morning' | 'midday' | 'evening';
 
 export type User = {
@@ -19,6 +19,8 @@ export type User = {
   hintLang: HintLang;
   status: 'active' | 'paused' | 'blocked';
   pending: Pending | null;
+  /** Chosen /topic id, or 'mix'. */
+  topic: string;
 };
 
 type Row = Record<string, any>;
@@ -30,6 +32,7 @@ function toUser(row: Row): User {
     hintLang: row.hint_lang,
     status: row.status,
     pending: row.pending ?? null,
+    topic: row.topic ?? 'mix',
   };
 }
 
@@ -82,6 +85,30 @@ export async function setPending(id: number, pending: Pending | null) {
   await sql()`update users set pending = ${pending === null ? null : JSON.stringify(pending)}::jsonb where id = ${id}`;
 }
 
+/** Switches the user's topic; the topic week starts on `startDay`. */
+export async function setTopic(id: number, topic: string, startDay: string) {
+  await sql()`update users set topic = ${topic}, topic_started = ${startDay}::date where id = ${id}`;
+}
+
+/**
+ * Users whose topic week ends today. Their next week is booked to start tomorrow
+ * (same topic unless they pick another), and they are returned to be asked once.
+ */
+export async function rollTopicWeeks(day: string, tomorrow: string): Promise<User[]> {
+  const rows = await sql()`
+    update users set topic_started = ${tomorrow}::date
+    where status = 'active' and topic <> 'mix'
+      and topic_started is not null and topic_started <= ${day}::date - 6
+    returning *`;
+  return rows.map(toUser);
+}
+
+/** Topics that at least one active user is on. */
+export async function activeTopics(): Promise<string[]> {
+  const rows = await sql()`select distinct topic from users where status = 'active'`;
+  return rows.map((r) => r.topic as string);
+}
+
 /** Atomically spends one of today's Gemini checks. False when the daily limit is reached. */
 export async function useCheck(id: number, day: string): Promise<boolean> {
   const rows = await sql()`
@@ -125,34 +152,37 @@ export async function claimDelivery(userId: number, day: string, stage: Stage): 
 
 // ---- lessons -------------------------------------------------------------
 
-export async function getLesson(day: string): Promise<Lesson | null> {
-  const [row] = await sql()`select content from lessons where day = ${day}::date`;
-  return row ? (row.content as Lesson) : null;
+// The row's topic_id is the source of truth (lessons saved before topics existed have none in content).
+const toLesson = (row: Row): Lesson => ({ ...row.content, topic: row.topic_id, theme: row.content.theme ?? row.topic });
+
+export async function getLesson(day: string, topic: string): Promise<Lesson | null> {
+  const [row] = await sql()`select * from lessons where day = ${day}::date and topic_id = ${topic}`;
+  return row ? toLesson(row) : null;
 }
 
-/** Most recent lessons before `day`, newest first. */
-export async function getRecentLessons(day: string, limit: number): Promise<Lesson[]> {
+/** Most recent lessons of `topic` before `day`, newest first. */
+export async function getRecentLessons(day: string, topic: string, limit: number): Promise<Lesson[]> {
   const rows = await sql()`
-    select content from lessons where day < ${day}::date order by day desc limit ${limit}`;
-  return rows.map((r) => r.content as Lesson);
+    select * from lessons where day < ${day}::date and topic_id = ${topic} order by day desc limit ${limit}`;
+  return rows.map(toLesson);
 }
 
-export async function getUsedWords(): Promise<string[]> {
-  const rows = await sql()`select word from used_words`;
+export async function getUsedWords(topic: string): Promise<string[]> {
+  const rows = await sql()`select word from used_words where topic_id = ${topic}`;
   return rows.map((r) => r.word as string);
 }
 
 /** Stores the lesson and marks its words as used. If another run saved this day first, keeps that one. */
 export async function saveLesson(lesson: Lesson): Promise<boolean> {
   const inserted = await sql()`
-    insert into lessons (day, topic, content)
-    values (${lesson.day}::date, ${lesson.topic}, ${JSON.stringify(lesson)}::jsonb)
+    insert into lessons (day, topic_id, topic, content)
+    values (${lesson.day}::date, ${lesson.topic}, ${lesson.theme}, ${JSON.stringify(lesson)}::jsonb)
     on conflict do nothing returning day`;
   if (inserted.length === 0) return false;
   const words = lesson.words.map((w) => w.word.toLowerCase());
   await sql()`
-    insert into used_words (word, day)
-    select w, ${lesson.day}::date from unnest(${words}::text[]) as w
+    insert into used_words (topic_id, word, day)
+    select ${lesson.topic}, w, ${lesson.day}::date from unnest(${words}::text[]) as w
     on conflict do nothing`;
   return true;
 }

@@ -1,11 +1,14 @@
 import { GrammyError, InlineKeyboard, InputFile, type Api } from 'grammy';
 import { config } from './config.js';
+import { MIX, MIX_LABEL, TOPICS, topicLabel } from './content/topics.js';
 import {
+  activeTopics,
   claimDelivery,
   cleanupProcessedUpdates,
   getLesson,
   getMediaFileId,
   pauseInactiveUsers,
+  rollTopicWeeks,
   saveMediaFileId,
   setPending,
   setStatus,
@@ -86,17 +89,30 @@ export async function sendModelAnswerVoice(api: Api, chatId: number, text: strin
   });
 }
 
-// ---- tasks (one question at a time) ---------------------------------------
+// ---- keyboards -------------------------------------------------------------
 
-export function taskKeyboard(day: string, kind: TaskKind, index: number) {
-  return new InlineKeyboard().text('⏭ Skip', `next:${day}:${kind}:${index}`);
+/** `mode`: 'start' (onboarding), 'week' (weekly offer, applies tomorrow) or '' (/topic, applies now). */
+export function topicKeyboard(mode: '' | 'start' | 'week', current?: string) {
+  const kb = new InlineKeyboard();
+  const suffix = mode ? `:${mode}` : '';
+  TOPICS.forEach((t, i) => {
+    kb.text(t.id === current ? `✅ ${t.label}` : t.label, `topic:${t.id}${suffix}`);
+    if (i % 2 === 1) kb.row();
+  });
+  return kb.row().text(current === MIX ? `✅ ${MIX_LABEL}` : MIX_LABEL, `topic:${MIX}${suffix}`);
 }
 
+export function nextCallback(lesson: Pick<Lesson, 'day' | 'topic'>, kind: TaskKind, index: number) {
+  return `next:${lesson.day}:${lesson.topic}:${kind}:${index}`;
+}
+
+// ---- tasks (one question at a time) ---------------------------------------
+
 export async function startTask(api: Api, user: User, lesson: Lesson, kind: TaskKind, index: number) {
-  const keyboard = taskKeyboard(lesson.day, kind, index);
+  const keyboard = new InlineKeyboard().text('⏭ Skip', nextCallback(lesson, kind, index));
   if (kind === 'speaking') {
     const caption = speakingCaption(lesson, index);
-    const ok = await sendClip(api, user.id, lesson.day, `speaking:${index}`, lesson.speaking[index]!, STYLE.question, {
+    const ok = await sendClip(api, user.id, lesson.day, `${lesson.topic}:speaking:${index}`, lesson.speaking[index]!, STYLE.question, {
       caption,
       reply_markup: keyboard,
     });
@@ -104,12 +120,12 @@ export async function startTask(api: Api, user: User, lesson: Lesson, kind: Task
   } else {
     await sendHtml(api, user.id, writingMessage(lesson, index), keyboard);
   }
-  await setPending(user.id, { day: lesson.day, kind, index });
+  await setPending(user.id, { day: lesson.day, topic: lesson.topic, kind, index });
 }
 
 /** Moves on from task `index` (after “Next” or “Skip”). */
-export async function advanceTask(api: Api, user: User, day: string, kind: TaskKind, index: number) {
-  const lesson = await getLesson(day);
+export async function advanceTask(api: Api, user: User, day: string, topic: string, kind: TaskKind, index: number) {
+  const lesson = await getLesson(day, topic);
   if (!lesson) return;
   const next = index + 1;
   if (next < lesson[kind].length) {
@@ -125,10 +141,10 @@ export async function advanceTask(api: Api, user: User, day: string, kind: TaskK
 export async function sendStage(api: Api, user: User, lesson: Lesson, stage: Stage) {
   if (stage === 'morning') {
     await sendHtml(api, user.id, wordsMessage(lesson, user.hintLang));
-    await sendClip(api, user.id, lesson.day, 'words', wordsScript(lesson), STYLE.words);
+    await sendClip(api, user.id, lesson.day, `${lesson.topic}:words`, wordsScript(lesson), STYLE.words);
   } else if (stage === 'midday') {
     await sendHtml(api, user.id, storyMessage(lesson));
-    await sendClip(api, user.id, lesson.day, 'story', `${lesson.story.title}.\n\n${lesson.story.text}`, STYLE.story);
+    await sendClip(api, user.id, lesson.day, `${lesson.topic}:story`, `${lesson.story.title}.\n\n${lesson.story.text}`, STYLE.story);
     await startTask(api, user, lesson, 'speaking', 0);
   } else {
     await sendHtml(api, user.id, eveningIntro());
@@ -143,10 +159,44 @@ export async function sendStage(api: Api, user: User, lesson: Lesson, stage: Sta
   }
 }
 
+/** Runs `fn` over `items` with at most `limit` in flight. */
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]!).then(
+        (value) => ({ status: 'fulfilled' as const, value }),
+        (reason) => ({ status: 'rejected' as const, reason }),
+      );
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+/**
+ * Generates the lessons for several topics in parallel (Gemini-bound, so a few at a time).
+ * With `startBefore`, topics not started by then are skipped (the morning run or /today makes them).
+ */
+async function ensureLessons(day: string, topics: string[], startBefore = Infinity): Promise<Map<string, Lesson>> {
+  const results = await mapLimit(topics, 3, async (topic) => {
+    if (Date.now() > startBefore) throw new Error('out of time, skipped');
+    return ensureLesson(day, topic);
+  });
+  const lessons = new Map<string, Lesson>();
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') lessons.set(topics[i]!, r.value);
+    else console.error(`lesson ${day}/${topics[i]} failed`, r.reason);
+  });
+  return lessons;
+}
+
 /** Cron entry point: sends `stage` of today's lesson to every active user who hasn't had it. */
 export async function runScheduledStage(api: Api, stage: Stage, deadline: number) {
   const day = today();
-  const report = { day, stage, sent: 0, failed: 0, skipped: 0, paused: 0 };
+  const report = { day, stage, sent: 0, failed: 0, skipped: 0, paused: 0, topicOffers: 0 };
 
   if (stage === 'morning') {
     await cleanupProcessedUpdates();
@@ -159,29 +209,42 @@ export async function runScheduledStage(api: Api, stage: Stage, deadline: number
   }
 
   const users = await usersAwaiting(day, stage);
-  if (users.length) {
-    const lesson = await ensureLesson(day);
-    for (const user of users) {
-      if (Date.now() > deadline) {
-        report.skipped = users.length - report.sent - report.failed;
-        console.warn('time budget reached, stopping broadcast', report);
-        break;
-      }
-      if (!(await claimDelivery(user.id, day, stage))) continue;
-      try {
-        await sendStage(api, user, lesson, stage);
-        report.sent++;
-      } catch (error) {
-        report.failed++;
-        if (error instanceof GrammyError && error.error_code === 403) await setStatus(user.id, 'blocked');
-        else console.error(`sending ${stage} to ${user.id} failed`, error);
-      }
+  const lessons = await ensureLessons(day, [...new Set(users.map((u) => u.topic))]);
+  for (const user of users) {
+    if (Date.now() > deadline) {
+      report.skipped = users.length - report.sent - report.failed;
+      console.warn('time budget reached, stopping broadcast', report);
+      break;
+    }
+    const lesson = lessons.get(user.topic);
+    if (!lesson) {
+      report.failed++; // lesson generation failed; the user can still open it later via /today
+      continue;
+    }
+    if (!(await claimDelivery(user.id, day, stage))) continue;
+    try {
+      await sendStage(api, user, lesson, stage);
+      report.sent++;
+    } catch (error) {
+      report.failed++;
+      if (error instanceof GrammyError && error.error_code === 403) await setStatus(user.id, 'blocked');
+      else console.error(`sending ${stage} to ${user.id} failed`, error);
     }
   }
 
-  // Prepare tomorrow's lesson in advance so the morning run only has to send it.
-  if (stage === 'evening' && Date.now() < deadline - 120_000) {
-    await ensureLesson(addDays(day, 1)).catch((e) => console.warn('pre-generating tomorrow failed', e));
+  if (stage === 'evening') {
+    // A topic week is over: offer the next topic once. Staying silent = one more week of the same topic.
+    for (const user of await rollTopicWeeks(day, addDays(day, 1))) {
+      report.topicOffers++;
+      await api
+        .sendMessage(user.id, TEXT.weekOffer(topicLabel(user.topic)), {
+          parse_mode: 'HTML',
+          reply_markup: topicKeyboard('week', user.topic),
+        })
+        .catch((e) => console.warn(`topic offer to ${user.id} failed`, e));
+    }
+    // Prepare tomorrow's lessons in advance so the morning run only has to send them.
+    await ensureLessons(addDays(day, 1), await activeTopics(), deadline - 90_000);
   }
   return report;
 }

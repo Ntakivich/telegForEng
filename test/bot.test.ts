@@ -16,7 +16,7 @@ vi.mock('../src/db.js', () => ({
   cleanupProcessedUpdates: async () => {},
   getUser: async (id: number) => state.users.get(id) ?? null,
   createUser: async (id: number, firstName: string, hintLang: string) => {
-    const user = { id, firstName, hintLang, status: 'active', pending: null };
+    const user = { id, firstName, hintLang, status: 'active', pending: null, topic: 'mix' };
     state.users.set(id, user);
     return user;
   },
@@ -24,6 +24,17 @@ vi.mock('../src/db.js', () => ({
   setHintLang: async (id: number, lang: string) => void (state.users.get(id).hintLang = lang),
   setStatus: async (id: number, status: string) => void (state.users.get(id).status = status),
   setPending: async (id: number, pending: unknown) => void (state.users.get(id).pending = pending),
+  setTopic: async (id: number, topic: string, started: string) =>
+    void Object.assign(state.users.get(id), { topic, topicStarted: started }),
+  rollTopicWeeks: async (day: string, tomorrow: string) => {
+    const weekAgo = new Date(Date.parse(`${day}T00:00:00Z`) - 6 * 86_400_000).toISOString().slice(0, 10);
+    const due = [...state.users.values()].filter(
+      (u) => u.status === 'active' && u.topic !== 'mix' && u.topicStarted && u.topicStarted <= weekAgo,
+    );
+    due.forEach((u) => (u.topicStarted = tomorrow));
+    return due;
+  },
+  activeTopics: async () => [...new Set([...state.users.values()].filter((u) => u.status === 'active').map((u) => u.topic))],
   useCheck: async () => true,
   usersAwaiting: async (day: string, stage: string) =>
     [...state.users.values()].filter((u) => u.status === 'active' && !state.deliveries.has(`${u.id}|${day}|${stage}`)),
@@ -34,10 +45,10 @@ vi.mock('../src/db.js', () => ({
     state.deliveries.add(key);
     return true;
   },
-  getLesson: async (day: string) => state.lessons.get(day) ?? null,
+  getLesson: async (day: string, topic: string) => state.lessons.get(`${day}|${topic}`) ?? null,
   getRecentLessons: async () => [],
   getUsedWords: async () => [],
-  saveLesson: async (l: Lesson) => (state.lessons.set(l.day, l), true),
+  saveLesson: async (l: Lesson) => (state.lessons.set(`${l.day}|${l.topic}`, l), true),
   getMediaFileId: async (day: string, key: string) => state.media.get(`${day}|${key}`) ?? null,
   saveMediaFileId: async (day: string, key: string, id: string) => void state.media.set(`${day}|${key}`, id),
   saveAnswer: async (a: any) => state.answers.push(a),
@@ -99,9 +110,10 @@ const callback = (data: string) => ({
   },
 });
 
-const lessonFor = (day: string): Lesson => ({
+const lessonFor = (day: string, topic = 'mix'): Lesson => ({
   day,
-  topic: 'Food and cooking',
+  topic,
+  theme: 'Cooking at home',
   title: '🍳 Kitchen time',
   words: ['bake', 'recipe', 'oven', 'fridge', 'plate', 'taste'].map((word) => ({
     word, pos: 'noun', ipa: 'x', meaning: `meaning of ${word}`, translation: { ru: 'р', uk: 'у', pl: 'p' },
@@ -118,6 +130,13 @@ const lessonFor = (day: string): Lesson => ({
   ],
 });
 
+const putLesson = (day: string, topic = 'mix') => state.lessons.set(`${day}|${topic}`, lessonFor(day, topic));
+const rawLesson = (suffix: string) => {
+  const { day: _d, topic: _t, theme: _th, review_words: _r, ...raw } = lessonFor('x');
+  return { ...raw, words: raw.words.map((w) => ({ ...w, word: `${w.word}${suffix}` })) };
+};
+const user = (extra: object = {}) => ({ id: 42, firstName: 'Olena', hintLang: 'ru', status: 'active', pending: null, topic: 'mix', ...extra });
+
 beforeEach(() => {
   calls = [];
   state.users.clear();
@@ -130,9 +149,9 @@ beforeEach(() => {
 });
 
 describe('bot flows', () => {
-  it('onboards a new user and sends today’s words after the language is chosen', async () => {
+  it('onboards: language → topic list → today’s words for the chosen topic', async () => {
     const bot = await makeBot();
-    state.lessons.set(today(), lessonFor(today()));
+    putLesson(today());
     await bot.handleUpdate(message({ text: '/start', entities: [{ type: 'bot_command', offset: 0, length: 6 }] }));
     expect(state.users.get(42)).toMatchObject({ firstName: 'Olena', status: 'active' });
     const welcome = calls.find((c) => c.method === 'sendMessage')!;
@@ -141,18 +160,29 @@ describe('bot flows', () => {
     calls = [];
     await bot.handleUpdate(callback('lang:uk:start'));
     expect(state.users.get(42).hintLang).toBe('uk');
+    const topicList = calls.find((c) => c.method === 'sendMessage' && c.payload.text.includes('Choose a topic'))!;
+    const topicButtons = topicList.payload.reply_markup.inline_keyboard.flat().map((b: any) => b.callback_data);
+    expect(topicButtons).toContain('topic:food:start');
+    expect(topicButtons).toContain('topic:mix:start');
+
+    calls = [];
+    putLesson(today(), 'food');
+    await bot.handleUpdate(callback('topic:food:start'));
+    expect(state.users.get(42)).toMatchObject({ topic: 'food', topicStarted: today() });
     const words = calls.find((c) => c.method === 'sendMessage' && c.payload.text.includes('Good morning'))!;
     expect(words.payload.text).toContain('<b>1. bake</b>');
     expect(words.payload.text).toContain('🔤 <i>у</i>');
     expect(calls.some((c) => c.method === 'sendVoice')).toBe(true);
+    expect(words.payload.text).toContain('🍝 Food &amp; cooking · Cooking at home');
     expect(state.deliveries.has(`42|${today()}|morning`)).toBe(true);
+    expect(state.media.has(`${today()}|food:words`)).toBe(true);
   });
 
   it('reviews a voice answer to the pending question and moves to the next one', async () => {
     const bot = await makeBot();
     const day = today();
-    state.lessons.set(day, lessonFor(day));
-    state.users.set(42, { id: 42, firstName: 'Olena', hintLang: 'ru', status: 'active', pending: { day, kind: 'speaking', index: 0 } });
+    putLesson(day);
+    state.users.set(42, user({ pending: { day, topic: 'mix', kind: 'speaking', index: 0 } }));
     gemini.generateJson.mockResolvedValueOnce({
       transcript: 'Anna was sad because oven broken',
       understood: true,
@@ -171,25 +201,25 @@ describe('bot flows', () => {
     const reply = calls.find((c) => c.method === 'sendMessage')!;
     expect(reply.payload.text).toContain('<s>oven broken</s> → <b>her oven was broken</b>');
     const buttons = reply.payload.reply_markup.inline_keyboard.flat().map((b: any) => b.callback_data);
-    expect(buttons).toEqual(['say:1', `next:${day}:speaking:0`]);
+    expect(buttons).toEqual(['say:1', `next:${day}:mix:speaking:0`]);
     expect(state.answers[0]).toMatchObject({ task: 'speaking:0', kind: 'voice' });
 
     calls = [];
-    await bot.handleUpdate(callback(`next:${day}:speaking:0`));
+    await bot.handleUpdate(callback(`next:${day}:mix:speaking:0`));
     const q2 = calls.find((c) => c.method === 'sendVoice')!;
     expect(q2.payload.caption).toContain('Question 2/2');
-    expect(state.users.get(42).pending).toEqual({ day, kind: 'speaking', index: 1 });
-    expect(state.media.get(`${day}|speaking:1`)).toBeDefined();
+    expect(state.users.get(42).pending).toEqual({ day, topic: 'mix', kind: 'speaking', index: 1 });
+    expect(state.media.get(`${day}|mix:speaking:1`)).toBeDefined();
 
     calls = [];
-    await bot.handleUpdate(callback(`next:${day}:speaking:1`));
+    await bot.handleUpdate(callback(`next:${day}:speaking:1`)); // old button format (no topic) still works
     expect(state.users.get(42).pending).toBeNull();
     expect(calls.some((c) => c.method === 'sendMessage' && c.payload.text.includes('all for speaking'))).toBe(true);
   });
 
   it('checks a free text message without a task', async () => {
     const bot = await makeBot();
-    state.users.set(42, { id: 42, firstName: 'Olena', hintLang: 'en', status: 'active', pending: null });
+    state.users.set(42, user({ hintLang: 'en' }));
     gemini.generateJson.mockResolvedValueOnce({
       transcript: '', understood: true, praise: 'Nice!', corrections: [], improved: '', tip: '', used_words: [],
     });
@@ -217,26 +247,74 @@ describe('scheduled evening run', () => {
   it('sends quiz polls + first writing task once per user, and pre-generates tomorrow', async () => {
     const bot = await makeBot();
     const day = today();
-    state.lessons.set(day, lessonFor(day));
-    state.users.set(42, { id: 42, firstName: 'Olena', hintLang: 'ru', status: 'active', pending: null });
-    state.users.set(43, { id: 43, firstName: 'Max', hintLang: 'ru', status: 'paused', pending: null });
-    gemini.generateJson.mockImplementation(async () => {
-      const { day: _d, topic: _t, review_words: _r, ...raw } = lessonFor('x');
-      return { ...raw, words: [...raw.words.map((w) => ({ ...w, word: `${w.word}2` }))] };
-    });
+    putLesson(day);
+    state.users.set(42, user());
+    state.users.set(43, user({ id: 43, firstName: 'Max', status: 'paused' }));
+    gemini.generateJson.mockImplementation(async () => rawLesson('2'));
 
     const report = await runScheduledStage(bot.api, 'evening', Date.now() + 270_000);
     expect(report).toMatchObject({ sent: 1, failed: 0 });
     const polls = calls.filter((c) => c.method === 'sendPoll');
     expect(polls).toHaveLength(3);
     expect(polls[0]!.payload).toMatchObject({ chat_id: 42, type: 'quiz', correct_option_ids: [0] });
-    expect(state.users.get(42).pending).toEqual({ day, kind: 'writing', index: 0 });
+    expect(state.users.get(42).pending).toEqual({ day, topic: 'mix', kind: 'writing', index: 0 });
     expect(calls.every((c) => c.payload.chat_id !== 43)).toBe(true);
     expect([...state.lessons.keys()]).toHaveLength(2); // tomorrow prepared
+    expect(report.topicOffers).toBe(0); // “mix” users are never asked
 
     calls = [];
     const again = await runScheduledStage(bot.api, 'evening', Date.now() + 270_000);
     expect(again.sent).toBe(0);
     expect(calls.filter((c) => c.method === 'sendPoll')).toHaveLength(0);
+  });
+});
+
+describe('topics', () => {
+  const addDays = (day: string, n: number) => new Date(Date.parse(`${day}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
+
+  it('/topic shows the list with the current topic ticked and switches right away', async () => {
+    const bot = await makeBot();
+    const day = today();
+    state.users.set(42, user({ topic: 'food', topicStarted: addDays(day, -2) }));
+    await bot.handleUpdate(message({ text: '/topic', entities: [{ type: 'bot_command', offset: 0, length: 6 }] }));
+    const list = calls.find((c) => c.method === 'sendMessage')!;
+    const labels = list.payload.reply_markup.inline_keyboard.flat().map((b: any) => b.text);
+    expect(labels).toContain('✅ 🍝 Food & cooking');
+
+    calls = [];
+    await bot.handleUpdate(callback('topic:food'));
+    expect(calls.find((c) => c.method === 'sendMessage')!.payload.text).toContain('already on');
+    expect(state.users.get(42).topicStarted).toBe(addDays(day, -2)); // unchanged
+
+    calls = [];
+    putLesson(day, 'travel');
+    await bot.handleUpdate(callback('topic:travel'));
+    expect(state.users.get(42)).toMatchObject({ topic: 'travel', topicStarted: day });
+    expect(calls.some((c) => c.method === 'sendMessage' && c.payload.text.includes('Good morning'))).toBe(true);
+  });
+
+  it('evening run: each topic gets its own lesson; a finished week gets one offer that applies tomorrow', async () => {
+    const bot = await makeBot();
+    const day = today();
+    putLesson(day, 'food');
+    putLesson(day, 'travel');
+    state.users.set(42, user({ topic: 'food', topicStarted: addDays(day, -6) })); // 7th day of the week
+    state.users.set(44, user({ id: 44, topic: 'travel', topicStarted: addDays(day, -2) }));
+    gemini.generateJson.mockImplementation(async () => rawLesson('3'));
+
+    const report = await runScheduledStage(bot.api, 'evening', Date.now() + 270_000);
+    expect(report).toMatchObject({ sent: 2, topicOffers: 1 });
+    expect(state.users.get(42).pending.topic).toBe('food');
+    expect(state.users.get(44).pending.topic).toBe('travel');
+    const offer = calls.find((c) => c.method === 'sendMessage' && c.payload.text.includes('finished a week'))!;
+    expect(offer.payload.chat_id).toBe(42);
+    expect(state.users.get(42).topicStarted).toBe(addDays(day, 1)); // silence = one more week
+    expect(state.lessons.has(`${addDays(day, 1)}|food`) && state.lessons.has(`${addDays(day, 1)}|travel`)).toBe(true);
+
+    calls = [];
+    await bot.handleUpdate(callback('topic:health:week'));
+    expect(state.users.get(42)).toMatchObject({ topic: 'health', topicStarted: addDays(day, 1) });
+    expect(calls.find((c) => c.method === 'sendMessage')!.payload.text).toContain('starts tomorrow morning');
+    expect(calls.some((c) => c.method === 'sendVoice')).toBe(false); // nothing sent today
   });
 });

@@ -20,7 +20,10 @@ export type QuizItem = {
 
 export type Lesson = {
   day: string; // YYYY-MM-DD in config.timezone
+  /** Topic id from the catalog, or 'mix'. */
   topic: string;
+  /** The day's focus, e.g. “At the airport”. */
+  theme: string;
   title: string;
   words: WordCard[];
   /** Words from earlier lessons woven into today's story and quiz (spaced review). */

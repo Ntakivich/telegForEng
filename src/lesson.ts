@@ -1,12 +1,12 @@
 import { config } from './config.js';
-import { TOPICS } from './content/topics.js';
+import { MIX, MIX_THEMES, TOPICS } from './content/topics.js';
 import { A2_WORDS, type WordEntry } from './content/words-a2.js';
 import { getLesson, getRecentLessons, getUsedWords, saveLesson } from './db.js';
 import { generateJson } from './gemini.js';
 import type { Lesson, QuizItem, WordCard } from './lesson-types.js';
 
 export const NEW_WORDS_PER_DAY = 6;
-/** Expanding review intervals: words from 1, 3, 7 and 14 days ago come back. */
+/** Expanding review intervals: words from 1, 3, 7 and 14 lessons ago (same topic) come back. */
 const REVIEW_INTERVALS = [1, 3, 7, 14];
 
 // ---- dates -----------------------------------------------------------------
@@ -30,8 +30,10 @@ function dayNumber(day: string): number {
   return Math.round(Date.parse(`${day}T00:00:00Z`) / 86_400_000);
 }
 
-export function topicFor(day: string): string {
-  return TOPICS[dayNumber(day) % TOPICS.length]!;
+/** The day's focus: the next focus of the chosen topic, or a new theme every day for “mix”. */
+export function themeFor(topic: string, day: string): string {
+  const focuses = TOPICS.find((t) => t.id === topic)?.focuses ?? MIX_THEMES;
+  return focuses[dayNumber(day) % focuses.length]!;
 }
 
 // ---- word selection --------------------------------------------------------
@@ -41,11 +43,11 @@ export function unusedWords(used: Iterable<string>): WordEntry[] {
   return A2_WORDS.filter((w) => !seen.has(w.word.toLowerCase()));
 }
 
-/** One or two words from each lesson taught 1/3/7/14 days before `day`. */
+/** One or two words from the lessons 1/3/7/14 lessons back (`recent` is newest first). */
 export function pickReviewWords(day: string, recent: Lesson[]): string[] {
   const out: string[] = [];
   for (const interval of REVIEW_INTERVALS) {
-    const lesson = recent.find((l) => l.day === addDays(day, -interval));
+    const lesson = recent[interval - 1];
     if (!lesson?.words.length) continue;
     const take = interval <= 3 ? 2 : 1;
     const start = dayNumber(day) % lesson.words.length;
@@ -119,11 +121,13 @@ for adult learners of English at CEFR level A2. Everything must be natural, corr
 easy: short sentences, high-frequency words, A2 grammar only (present simple/continuous, past simple,
 be going to, will for simple predictions, can/have to/should, comparatives). Never use rare idioms.`;
 
-function lessonPrompt(topic: string, candidates: WordEntry[], reviewWords: string[]): string {
+function lessonPrompt(topic: string, theme: string, candidates: WordEntry[], reviewWords: string[]): string {
   const list = candidates.map((w) => `${w.word} (${w.pos})`).join(', ');
-  return `Today's topic: ${topic}
+  const name = TOPICS.find((t) => t.id === topic)?.name;
+  const heading = name ? `Topic of the week: ${name}\nToday's focus: ${theme}` : `Today's topic: ${theme}`;
+  return `${heading}
 
-NEW WORDS — choose exactly ${NEW_WORDS_PER_DAY} words from the CANDIDATES list that fit the topic best
+NEW WORDS — choose exactly ${NEW_WORDS_PER_DAY} words from the CANDIDATES list that fit today's focus best
 and are most useful in everyday life. Copy the spelling exactly. Include at least one verb.
 CANDIDATES: ${list}
 
@@ -151,12 +155,17 @@ Fill every field:
   correct_index is 0-based.`;
 }
 
-type RawLesson = Omit<Lesson, 'day' | 'topic' | 'review_words'>;
+type RawLesson = Omit<Lesson, 'day' | 'topic' | 'theme' | 'review_words'>;
 
 const clip = (s: string, max: number) => (s.length <= max ? s : `${s.slice(0, max - 1).trimEnd()}…`);
 
 /** Checks and normalises the model output; throws if it is not usable. */
-export function validateLesson(raw: RawLesson, day: string, topic: string, reviewWords: string[], used: Set<string>): Lesson {
+export function validateLesson(
+  raw: RawLesson,
+  meta: { day: string; topic: string; theme: string },
+  reviewWords: string[],
+  used: Set<string>,
+): Lesson {
   const seen = new Set<string>();
   const words: WordCard[] = [];
   for (const w of raw.words ?? []) {
@@ -192,22 +201,21 @@ export function validateLesson(raw: RawLesson, day: string, topic: string, revie
   }
 
   return {
-    day,
-    topic,
-    title: raw.title?.trim() || topic,
+    ...meta,
+    title: raw.title?.trim() || meta.theme,
     words,
     review_words: reviewWords,
-    story: { title: raw.story.title?.trim() || topic, text: raw.story.text.trim() },
+    story: { title: raw.story.title?.trim() || meta.theme, text: raw.story.text.trim() },
     speaking,
     writing,
     quiz,
   };
 }
 
-async function generateLesson(day: string): Promise<Lesson> {
-  const [usedList, recent] = await Promise.all([getUsedWords(), getRecentLessons(day, 15)]);
+async function generateLesson(day: string, topic: string): Promise<Lesson> {
+  const [usedList, recent] = await Promise.all([getUsedWords(topic), getRecentLessons(day, topic, 15)]);
   const used = new Set(usedList.map((w) => w.toLowerCase()));
-  const topic = topicFor(day);
+  const theme = themeFor(topic, day);
   const reviewWords = pickReviewWords(day, recent);
   let candidates = unusedWords(used);
   if (candidates.length < NEW_WORDS_PER_DAY * 3) {
@@ -222,11 +230,11 @@ async function generateLesson(day: string): Promise<Lesson> {
       const raw = await generateJson<RawLesson>({
         models: config.lessonModels,
         system: LESSON_SYSTEM,
-        parts: [{ text: lessonPrompt(topic, candidates, reviewWords) }],
+        parts: [{ text: lessonPrompt(topic, theme, candidates, reviewWords) }],
         schema: LESSON_SCHEMA,
         temperature: 0.9,
       });
-      return validateLesson(raw, day, topic, reviewWords, used);
+      return validateLesson(raw, { day, topic, theme }, reviewWords, used);
     } catch (error) {
       lastError = error;
       console.warn(`lesson generation attempt ${attempt} failed`, error);
@@ -235,11 +243,11 @@ async function generateLesson(day: string): Promise<Lesson> {
   throw lastError;
 }
 
-/** Returns the lesson for `day`, generating and storing it on first use. */
-export async function ensureLesson(day: string): Promise<Lesson> {
-  const existing = await getLesson(day);
+/** Returns the lesson for `day` and `topic`, generating and storing it on first use. */
+export async function ensureLesson(day: string, topic: string = MIX): Promise<Lesson> {
+  const existing = await getLesson(day, topic);
   if (existing) return existing;
-  const lesson = await generateLesson(day);
+  const lesson = await generateLesson(day, topic);
   const saved = await saveLesson(lesson);
-  return saved ? lesson : ((await getLesson(day)) ?? lesson);
+  return saved ? lesson : ((await getLesson(day, topic)) ?? lesson);
 }

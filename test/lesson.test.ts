@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { A2_WORDS } from '../src/content/words-a2.js';
-import { addDays, pickReviewWords, topicFor, unusedWords, validateLesson } from '../src/lesson.js';
+import { addDays, pickReviewWords, themeFor, unusedWords, validateLesson } from '../src/lesson.js';
 import type { Lesson, WordCard } from '../src/lesson-types.js';
 
 const card = (word: string): WordCard => ({
@@ -25,34 +25,32 @@ const raw = {
 
 describe('validateLesson', () => {
   it('drops duplicate/used words and broken quiz items', () => {
-    const lesson = validateLesson(raw, '2026-09-28', 'Food', [], new Set(['plate']));
+    const lesson = validateLesson(raw, { day: '2026-09-28', topic: 'food', theme: 'Cooking' }, [], new Set(['plate']));
     expect(lesson.words.map((w) => w.word)).toEqual(['kitchen', 'bake', 'recipe', 'fridge', 'oven']);
     expect(lesson.quiz.map((q) => q.question)).toEqual(['Q1', 'Q4', 'Q5']);
   });
 
   it('rejects a lesson with too few new words', () => {
-    expect(() => validateLesson(raw, '2026-09-28', 'Food', [], new Set(['kitchen', 'bake', 'recipe']))).toThrow();
+    const meta = { day: '2026-09-28', topic: 'food', theme: 'Cooking' };
+    expect(() => validateLesson(raw, meta, [], new Set(['kitchen', 'bake', 'recipe']))).toThrow();
   });
 });
 
 describe('review words and topics', () => {
   const lesson = (day: string, words: string[]) => ({ day, words: words.map(card) }) as Lesson;
 
-  it('takes words from lessons 1, 3, 7 and 14 days back only', () => {
+  it('takes words from the lessons 1, 3, 7 and 14 lessons back only (newest first)', () => {
     const day = '2026-09-28';
-    const recent = [
-      lesson(addDays(day, -1), ['a1', 'a2', 'a3']),
-      lesson(addDays(day, -2), ['b1', 'b2']),
-      lesson(addDays(day, -3), ['c1', 'c2']),
-      lesson(addDays(day, -7), ['d1', 'd2']),
-    ];
+    const recent = ['a', 'b', 'c', 'd', 'e', 'f', 'g'].map((p, i) => lesson(addDays(day, -1 - i), [`${p}1`, `${p}2`]));
     const words = pickReviewWords(day, recent);
-    expect(words).toHaveLength(5);
-    expect(words.some((w) => w.startsWith('b'))).toBe(false);
+    expect(words).toHaveLength(5); // 2 + 2 + 1
+    expect(words.map((w) => w[0]).sort()).toEqual(['a', 'a', 'c', 'c', 'g']);
   });
 
-  it('rotates topics daily and never repeats taught words', () => {
-    expect(topicFor('2026-09-28')).not.toBe(topicFor('2026-09-29'));
+  it('gives each day of a topic week its own focus; mix rotates themes', () => {
+    const week = Array.from({ length: 7 }, (_, i) => themeFor('food', addDays('2026-09-28', i)));
+    expect(new Set(week).size).toBe(7);
+    expect(themeFor('mix', '2026-09-28')).not.toBe(themeFor('mix', '2026-09-29'));
     const left = unusedWords(['ability', 'ABROAD']);
     expect(left).toHaveLength(A2_WORDS.length - 2);
   });
